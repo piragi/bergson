@@ -109,10 +109,16 @@ def preprocess_grads(
     return grads
 
 
-def get_query_ds(score_cfg: ScoreConfig, device: str, rank: int | None = None):
+def get_query_ds(
+    score_cfg: ScoreConfig, device: str, rank: int | None = None
+) -> tuple[Dataset, dict[str, torch.Tensor] | None]:
     """
     Load and preprocess the query dataset to get the query gradients. Preconditioners
     may be mixed as described in https://arxiv.org/html/2410.17413v1#S3.
+
+    Returns a tuple of (query_ds, h_inv_sqrt) where h_inv_sqrt is a dictionary
+    of H^(-1/2) matrices per module (or None if no preconditioners are used).
+    These matrices should also be applied to train gradients during scoring.
     """
     # Collect the query gradients if they don't exist
     query_path = Path(score_cfg.query_path)
@@ -164,6 +170,8 @@ def get_query_ds(score_cfg: ScoreConfig, device: str, rank: int | None = None):
     use_q = score_cfg.query_preconditioner_path is not None
     use_i = score_cfg.index_preconditioner_path is not None
 
+    h_inv_sqrt: dict[str, torch.Tensor] | None = None
+
     if use_q or use_i:
         q, i = {}, {}
         if use_q:
@@ -187,14 +195,27 @@ def get_query_ds(score_cfg: ScoreConfig, device: str, rank: int | None = None):
             if (q and i)
             else (q or i)
         )
-        mixed_preconditioner = {
-            k: v.to(device) for k, v in mixed_preconditioner.items()
-        }
+
+        # Compute H^(-1/2) via eigendecomposition for each module
+        # This matches the math in the TrackStar paper: G = R^(-1/2) * grad
+        h_inv_sqrt = {}
+        for name, H in mixed_preconditioner.items():
+            H = H.to(device=device, dtype=torch.float64)
+            # Add damping for numerical stability
+            H = H + score_cfg.damping * torch.eye(
+                H.shape[0], device=H.device, dtype=H.dtype
+            )
+            eigval, eigvec = torch.linalg.eigh(H)
+            inv_sqrt_eigval = 1.0 / eigval.sqrt()
+            # H^(-1/2) = V @ diag(1/sqrt(λ)) @ V^T
+            h_inv_sqrt[name] = (eigvec * inv_sqrt_eigval @ eigvec.mT).to(
+                torch.float32
+            )
 
         def precondition(batch):
             for name in target_modules:
                 batch[name] = (
-                    batch[name].to(device) @ mixed_preconditioner[name]
+                    batch[name].to(device) @ h_inv_sqrt[name]
                 ).cpu()
 
             return batch
@@ -203,7 +224,7 @@ def get_query_ds(score_cfg: ScoreConfig, device: str, rank: int | None = None):
             precondition, batched=True, batch_size=score_cfg.batch_size
         )
 
-    return query_ds.with_format("torch", columns=score_cfg.modules)
+    return query_ds.with_format("torch", columns=score_cfg.modules), h_inv_sqrt
 
 
 def score_worker(
@@ -213,6 +234,7 @@ def score_worker(
     score_cfg: ScoreConfig,
     ds: Dataset | IterableDataset,
     query_grads: dict[str, torch.Tensor],
+    preconditioner: dict[str, torch.Tensor] | None = None,
 ):
     """
     Score worker executed per rank to produce and score gradients against a query.
@@ -232,6 +254,9 @@ def score_worker(
         The entire dataset to be indexed. A subset is assigned to each worker.
     query_grads : dict[str, torch.Tensor]
         Preprocessed query gradient tensors (often [1, grad_dim]) keyed by module name.
+    preconditioner : dict[str, torch.Tensor] | None
+        H^(-1/2) matrices per module to apply to train gradients during scoring.
+        Should match the preconditioner applied to query_grads.
     """
     torch.cuda.set_device(rank)
 
@@ -275,6 +300,7 @@ def score_worker(
             score_cfg,
             device=torch.device(f"cuda:{rank}"),
             dtype=model.dtype if model.dtype != "auto" else torch.float32,
+            preconditioner=preconditioner,
         )
 
         collect_gradients(**kwargs)
@@ -300,6 +326,7 @@ def score_worker(
                 score_cfg,
                 torch.device(f"cuda:{rank}"),
                 model.dtype if model.dtype != "auto" else torch.float32,
+                preconditioner=preconditioner,
             )
 
             collect_gradients(**kwargs)
@@ -337,7 +364,7 @@ def score_dataset(index_cfg: IndexConfig, score_cfg: ScoreConfig):
         json.dump(asdict(score_cfg), f, indent=2)
 
     ds = setup_data_pipeline(index_cfg)
-    query_ds = get_query_ds(score_cfg, f"cuda:{0}", 0)
+    query_ds, h_inv_sqrt = get_query_ds(score_cfg, f"cuda:{0}", 0)
     query_grads = preprocess_grads(
         query_ds,
         score_cfg.modules,
@@ -349,7 +376,7 @@ def score_dataset(index_cfg: IndexConfig, score_cfg: ScoreConfig):
     )
 
     launch_distributed_run(
-        "score", score_worker, [index_cfg, score_cfg, ds, query_grads]
+        "score", score_worker, [index_cfg, score_cfg, ds, query_grads, h_inv_sqrt]
     )
 
     shutil.move(index_cfg.partial_run_path, index_cfg.run_path)

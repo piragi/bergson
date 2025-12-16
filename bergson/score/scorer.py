@@ -16,6 +16,8 @@ class Scorer:
 
     device: torch.device
 
+    preconditioner: dict[str, torch.Tensor] | None
+
     def __init__(
         self,
         path: Path,
@@ -24,10 +26,12 @@ class Scorer:
         score_cfg: ScoreConfig,
         device: torch.device,
         dtype: torch.dtype,
+        preconditioner: dict[str, torch.Tensor] | None = None,
     ):
         self.device = device
         self.dtype = dtype
         self.num_items = num_items
+        self.preconditioner = preconditioner
 
         self.scorer_callback = self.build_scorer_callback(
             query_grads,
@@ -60,9 +64,13 @@ class Scorer:
         score_cfg: ScoreConfig,
     ) -> Callable:
         """Unified scorer builder for all scorer types."""
+        # Use float32 for scoring when preconditioner is used (for numerical stability)
+        # Otherwise use model dtype
+        scoring_dtype = torch.float32 if self.preconditioner is not None else self.dtype
+
         query_tensor = torch.cat(
             [
-                query_grads[m].to(device=self.device, dtype=self.dtype)
+                query_grads[m].to(device=self.device, dtype=scoring_dtype)
                 for m in score_cfg.modules
             ],
             dim=1,
@@ -70,7 +78,18 @@ class Scorer:
 
         @torch.inference_mode()
         def callback(mod_grads: dict[str, torch.Tensor]):
+            # Apply H^(-1/2) preconditioner to train grads if available
+            if self.preconditioner is not None:
+                mod_grads = {
+                    m: mod_grads[m].float() @ self.preconditioner[m]
+                    for m in score_cfg.modules
+                }
             grads = torch.cat([mod_grads[m] for m in score_cfg.modules], dim=1)
+
+            # Ensure consistent dtype for dot product
+            if grads.dtype != query_tensor.dtype:
+                grads = grads.to(query_tensor.dtype)
+
             if score_cfg.unit_normalize:
                 grads /= grads.norm(dim=1, keepdim=True)
 

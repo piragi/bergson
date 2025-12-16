@@ -193,6 +193,11 @@ class ScoreConfig:
     batch_size: int = 1024
     """Batch size for processing the query dataset."""
 
+    damping: float = 1e-4
+    """Damping factor for numerical stability when computing H^(-1/2).
+    This is added to the diagonal of the mixed preconditioner before
+    eigendecomposition to ensure numerical stability."""
+
 
 @dataclass
 class ReduceConfig:

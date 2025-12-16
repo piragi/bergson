@@ -68,9 +68,11 @@ class MemmapScoreWriter(ScoreWriter):
             formats.append("bool")
             offsets.append(i * 6 + 4)
 
-        total_bytes = sum(np.dtype(fmt).itemsize for fmt in formats)
+        # itemsize must cover the max offset + size of last field
+        # Last offset is (num_scores-1)*6 + 4, last field is 1 byte
+        max_offset = (self.num_scores - 1) * 6 + 4 + 1
         # Round up to the nearest 8 bytes
-        itemsize = ((total_bytes + 7) // 8) * 8
+        itemsize = ((max_offset + 7) // 8) * 8
 
         struct_dtype = {
             "names": names,
