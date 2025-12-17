@@ -198,6 +198,14 @@ class ScoreConfig:
     This is added to the diagonal of the mixed preconditioner before
     eigendecomposition to ensure numerical stability."""
 
+    index_gradients_path: str | None = None
+    """Path to pre-computed index gradients. When set, gradients are loaded
+    from disk in chunks instead of being recomputed. This enables fast
+    experimentation with different mixing coefficients."""
+
+    gradient_chunk_size: int = 1000
+    """Number of gradients to load per chunk when streaming from disk."""
+
 
 @dataclass
 class ReduceConfig:

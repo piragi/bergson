@@ -274,6 +274,41 @@ def score_worker(
             world_size=world_size,
         )
 
+    device = torch.device(f"cuda:{rank}")
+
+    # Stream from pre-computed gradients if path is provided
+    if score_cfg.index_gradients_path:
+        grad_path = Path(score_cfg.index_gradients_path)
+        mmap = load_gradients(grad_path, structured=True)
+        num_grads = mmap[mmap.dtype.names[0]].shape[0]
+        modules = score_cfg.modules or list(mmap.dtype.names)
+
+        scorer = Scorer(
+            index_cfg.partial_run_path,
+            num_grads,
+            query_grads,
+            score_cfg,
+            device=device,
+            dtype=torch.float32,
+            preconditioner=preconditioner,
+        )
+
+        chunk_size = score_cfg.gradient_chunk_size
+        for start_idx in tqdm(range(0, num_grads, chunk_size), desc="Scoring from disk"):
+            end_idx = min(start_idx + chunk_size, num_grads)
+            indices = list(range(start_idx, end_idx))
+
+            # Load chunk of gradients
+            mod_grads = {
+                name: torch.from_numpy(mmap[name][start_idx:end_idx].copy()).to(device)
+                for name in modules
+            }
+
+            scorer(indices, mod_grads)
+
+        scorer.writer.flush()
+        return
+
     model, target_modules = setup_model_and_peft(index_cfg, rank)
     model = cast(PreTrainedModel, model)
     processor = create_processor(index_cfg, rank)
@@ -298,7 +333,7 @@ def score_worker(
             len(ds),
             query_grads,
             score_cfg,
-            device=torch.device(f"cuda:{rank}"),
+            device=device,
             dtype=model.dtype if model.dtype != "auto" else torch.float32,
             preconditioner=preconditioner,
         )
